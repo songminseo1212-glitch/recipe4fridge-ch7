@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+.DS_Store
+__pycache__/
+*.pyc
+.claude/scheduled_tasks.lock
+data/
