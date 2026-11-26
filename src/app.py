@@ -347,18 +347,9 @@ def render_ingredient_editor():
 st.set_page_config(page_title="냉장고 식재료 인식", page_icon="🥬", layout="wide")
 render_sidebar_auth()
 
-# '자세히 보기' 버튼이 카드마다 다른 높이에 걸리지 않도록, 카드 안 마지막 요소(버튼)를 바닥에 붙인다.
 st.markdown(
     """
     <style>
-    div[data-testid="column"] > div[data-testid="stVerticalBlockBorderWrapper"] > div {
-        display: flex;
-        flex-direction: column;
-        height: 100%;
-    }
-    div[data-testid="column"] > div[data-testid="stVerticalBlockBorderWrapper"] > div > div:last-child {
-        margin-top: auto;
-    }
     .ingredient-chip {
         display: inline-block;
         background: #e8e8e8;
@@ -785,7 +776,11 @@ elif wizard_step == 3:
             cols = st.columns(len(recipes))
             for idx, (col, r) in enumerate(zip(cols, recipes)):
                 with col:
-                    with st.container(border=True, height=260):
+                    # 고정 높이(height=260)를 쓰면 내용이 넘칠 때 카드 안에 스크롤이 생기거나 버튼이 잘렸다.
+                    # height="stretch": 같은 줄의 열(column)은 가장 긴 카드 높이로 늘어나고, 카드는 그 열을 꽉 채운다.
+                    # 버튼 바로 위의 st.space("stretch")가 남는 공간을 채워서 버튼이 세 카드 모두 바닥에 붙는다.
+                    # 좁은 화면에서 열이 세로로 쌓이면 카드는 자기 내용 높이만큼만 차지한다.
+                    with st.container(border=True, height="stretch", key=f"recipe_card_{idx}"):
                         st.markdown(f"**{r.get('name') or '이름 없는 요리'}**")
                         st.write(cook_time_text(r))
                         missing = r.get("missing_ingredients") or []
@@ -793,6 +788,7 @@ elif wizard_step == 3:
                             st.warning("더 필요: " + ", ".join(missing))
                         else:
                             st.success("재료가 다 있어요!")
+                        st.space("stretch")
                         is_selected = idx == selected_idx
                         st.button(
                             "✓ 보는 중" if is_selected else "자세히 보기",
