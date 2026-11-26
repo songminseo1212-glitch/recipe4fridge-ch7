@@ -2,3 +2,8 @@
 # 기본 Streamlit 빨강(#FF4B4B)은 흰 글자 대비 3.3:1로 WCAG AA(4.5:1) 미달이라
 # 같은 색조를 유지한 채 어둡게 조정했다 (흰 글자 대비 약 5.4:1).
 primaryColor = "#D60000"
+
+[server]
+# 앱은 10MB까지만 받는다(app.py MAX_UPLOAD_BYTES). 업로더 안내 문구("Limit ...MB per file")가
+# 기본값 200MB로 보이면 사용자가 큰 파일을 올린 뒤에야 거절당하므로 같은 값으로 맞춘다.
+maxUploadSize = 10
