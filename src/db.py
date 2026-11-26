@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -48,22 +49,47 @@ def _connection_pool():
     )
 
 
+# 풀(최대 5개)이 모두 사용 중일 때 기다리는 최대 시간과 재확인 간격.
+POOL_WAIT_SECONDS = 5.0
+POOL_WAIT_INTERVAL = 0.05
+
+
+def _getconn_waiting(pool):
+    """풀에서 커넥션을 꺼낸다. 풀이 고갈(PoolError)되면 바로 실패하지 않고 잠시 기다렸다 다시 시도한다.
+
+    ThreadedConnectionPool.getconn은 고갈 시 대기하지 않고 즉시 PoolError를 낸다.
+    동시 접속이 순간적으로 5개를 넘는 경우 대부분 짧은 쿼리가 끝나며 곧 반납되므로 기다리면 풀린다.
+    """
+    deadline = time.monotonic() + POOL_WAIT_SECONDS
+    while True:
+        try:
+            return pool.getconn()
+        except psycopg2.pool.PoolError:
+            if pool.closed or time.monotonic() >= deadline:
+                raise
+            time.sleep(POOL_WAIT_INTERVAL)
+
+
 def _checkout_live_connection():
-    """풀에서 살아있는 커넥션을 꺼낸다. 죽어있으면 풀을 통째로 버리고 새로 만든다.
+    """풀에서 살아있는 커넥션을 꺼낸다. 죽어있으면 그 풀을 은퇴시키고 새 풀에서 다시 꺼낸다.
 
     앱이 잠들었다 깨어나면 풀 안의 커넥션이 하나가 아니라 전부 같은 이유로 죽어 있다.
-    그래서 커넥션 하나만 교체하지 않고 풀 전체를 폐기한다.
+    그래서 죽은 커넥션을 하나씩 검사(각각 tcp_user_timeout만큼 걸림)하지 않고 풀째 교체한다.
+
+    단, 예전 풀을 closeall()로 닫으면 다른 스레드(다른 사용자 세션)가 쓰고 있는 커넥션까지
+    끊어진다. 그래서 죽은 커넥션만 닫고, 예전 풀은 캐시에서 빼기만 한다. 사용 중이던 커넥션은
+    각 스레드가 그 풀에 정상 반납하고, 예전 풀 객체가 더 이상 참조되지 않으면 남은 커넥션과 함께 정리된다.
     """
     for last_attempt in (False, True):
         pool = _connection_pool()
-        conn = pool.getconn()
+        conn = _getconn_waiting(pool)
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
             return pool, conn
         except psycopg2.Error:
             try:
-                pool.closeall()
+                pool.putconn(conn, close=True)
             except psycopg2.Error:
                 pass
             _connection_pool.clear()
@@ -120,6 +146,12 @@ def init_db():
                     saved_at TEXT NOT NULL
                 )
                 """
+            )
+            # '내 레시피' 화면은 매 rerun마다 WHERE user_id = ? ORDER BY saved_at DESC로 조회한다.
+            # 인덱스가 없으면 전체 사용자의 저장 레시피를 순차 스캔한 뒤 정렬한다.
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_saved_recipes_user_saved_at "
+                "ON saved_recipes (user_id, saved_at DESC)"
             )
 
 
