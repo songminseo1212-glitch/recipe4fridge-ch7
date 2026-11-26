@@ -4,11 +4,18 @@ import json
 import re
 import uuid
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 import openrouter
 
 MAX_IMAGE_DIMENSION = 1024
+# 디코딩 전에 헤더의 가로×세로만 보고 거절하는 픽셀 수 상한 (약 8000×8000).
+# 10MB 용량 제한은 압축된 크기만 보므로, 단색 PNG처럼 작은 파일이 수억 픽셀로 풀리는 경우를 막는다.
+# 일반 폰 사진(12~50MP)은 통과한다. Pillow 기본값(약 1.8억 픽셀에서 오류)보다 엄격하다.
+MAX_INPUT_PIXELS = 64_000_000
+# st.image가 화면 표시용으로 줄이는 최대 폭(Streamlit 내부 MAXIMUM_CONTENT_WIDTH = 2×730)과 같게 맞춘다.
+PREVIEW_MAX_WIDTH = 1460
+_EXIF_ORIENTATION_TAG = 0x0112
 UNIT_OPTIONS = ["개", "병", "봉지", "팩", "단", "g", "kg", "ml", "L", "기타"]
 RECOGNITION_PROMPT = (
     '이 냉장고 사진에서 보이는 식재료를 한국어로 인식해서 JSON 배열 형식으로만 답해줘. '
@@ -42,6 +49,9 @@ PREFERRED_VISION_MODELS = [
 ]
 
 
+class InvalidImageError(ValueError):
+    """업로드 이미지를 읽을 수 없거나(손상·형식 오류) 해상도가 상한을 넘을 때."""
+
 
 def list_free_vision_models(allowed_models=None):
     """현재 사용 가능한 무료 비전 모델 id 목록. allowed_models가 주어지면 그 안에서만 고른다.
@@ -63,15 +73,91 @@ def list_free_vision_models_detailed():
     return openrouter.model_details(openrouter.free_model_entries(require_image=True))
 
 
+_DECODE_ERRORS = (OSError, ValueError, SyntaxError, EOFError, Image.DecompressionBombError)
+_UNREADABLE_MESSAGE = "이미지 파일을 읽을 수 없습니다. 손상되지 않은 JPG/PNG 파일인지 확인해주세요."
+
+
+def _open_checked(file_like):
+    """이미지를 연다(헤더만 읽음). 가로×세로가 MAX_INPUT_PIXELS를 넘으면 디코딩 전에 거절한다.
+
+    주의: PNG는 getexif()가 본문 전체를 디코딩하므로, 해상도 검사는 반드시 그보다 먼저 한다.
+    """
+    image = Image.open(file_like)
+    width, height = image.size
+    if width * height > MAX_INPUT_PIXELS:
+        image.close()
+        raise InvalidImageError(
+            f"이미지 해상도가 너무 큽니다 ({width}×{height}). "
+            f"{MAX_INPUT_PIXELS // 1_000_000}백만 화소 이하로 줄여서 올려주세요."
+        )
+    return image
+
+
+def _load_rgb(file_like, bound):
+    """이미지를 열어 EXIF 회전을 적용하고 bound(가로, 세로) 상자 안으로 축소한 RGB 이미지를 돌려준다.
+
+    - 디코딩 전에 헤더의 해상도로 MAX_INPUT_PIXELS를 검사한다.
+    - JPEG은 draft()로 DCT 단계에서 1/2·1/4·1/8 축소 디코딩해 큰 사진의 디코딩 시간과 메모리를 줄인다.
+      목표 크기의 2배 이상은 남기므로(thumbnail의 reducing_gap=2와 같은 기준) 최종 화질은 같다.
+    - 읽을 수 없는 파일은 InvalidImageError로 바꿔 올린다.
+    """
+    try:
+        image = _open_checked(file_like)
+        width, height = image.size
+        orientation = image.getexif().get(_EXIF_ORIENTATION_TAG, 1)
+        # 5~8은 90도 회전이라 화면 기준 가로·세로가 저장된 값과 뒤바뀐다.
+        shown_w, shown_h = (height, width) if orientation in (5, 6, 7, 8) else (width, height)
+        scale = min(bound[0] / shown_w, bound[1] / shown_h, 1.0)
+        if scale < 1.0:
+            image.draft(None, (max(1, int(width * scale * 2)), max(1, int(height * scale * 2))))
+        # 폰 사진은 픽셀이 누운 채 저장되고 EXIF로 회전 정보만 붙는 경우가 많다.
+        ImageOps.exif_transpose(image, in_place=True)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        image.thumbnail(bound)
+        return image
+    except InvalidImageError:
+        raise
+    except _DECODE_ERRORS as e:
+        # UnidentifiedImageError(형식 인식 불가), 잘린 파일(OSError) 등
+        raise InvalidImageError(_UNREADABLE_MESSAGE) from e
+
+
 def to_resized_data_uri(file_like):
-    """이미지를 긴 변 기준 MAX_IMAGE_DIMENSION 이하로 축소해 base64 data URI로 변환한다."""
-    image = Image.open(file_like).convert("RGB")
-    image.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
+    """이미지를 긴 변 기준 MAX_IMAGE_DIMENSION 이하로 축소해 base64 data URI로 변환한다.
+
+    이미지를 읽을 수 없거나 해상도가 너무 크면 InvalidImageError를 올린다.
+    """
+    image = _load_rgb(file_like, (MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=85)
     resized_bytes = buffer.getvalue()
     b64 = base64.b64encode(resized_bytes).decode()
     return f"data:image/jpeg;base64,{b64}", len(resized_bytes)
+
+
+def make_preview_bytes(raw_bytes):
+    """화면 표시용 이미지 바이트를 만든다.
+
+    st.image는 바이트를 받을 때마다(=rerun마다) 원본을 디코딩해 폭 1460px로 줄이고 JPEG로
+    다시 인코딩한다. 그 결과를 여기서 한 번만 만들어 두면 이후 rerun에서는 헤더만 읽고 끝난다.
+    폭이 이미 작고 회전 정보도 없으면 원본을 그대로 돌려준다 (st.image도 이 경우 원본을 쓴다).
+    이미지를 읽을 수 없거나 해상도가 너무 크면 InvalidImageError를 올린다.
+    """
+    try:
+        with _open_checked(io.BytesIO(raw_bytes)) as probe:
+            if probe.size[0] <= PREVIEW_MAX_WIDTH and probe.getexif().get(_EXIF_ORIENTATION_TAG, 1) == 1:
+                # 헤더만 정상이고 본문이 잘린 파일을 걸러내기 위해 끝까지 디코딩해 본다.
+                probe.load()
+                return raw_bytes
+    except InvalidImageError:
+        raise
+    except _DECODE_ERRORS as e:
+        raise InvalidImageError(_UNREADABLE_MESSAGE) from e
+    image = _load_rgb(io.BytesIO(raw_bytes), (PREVIEW_MAX_WIDTH, PREVIEW_MAX_WIDTH * 100))
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=90)
+    return buffer.getvalue()
 
 
 def call_vision_model(model, data_uri, api_key):

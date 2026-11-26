@@ -1,3 +1,4 @@
+import io
 import os
 import time
 import uuid
@@ -22,6 +23,8 @@ from recipe import (
 from vision import (
     MAX_IMAGE_DIMENSION,
     UNIT_OPTIONS,
+    InvalidImageError,
+    make_preview_bytes,
     merge_duplicate_ingredients,
     parse_ingredients,
     recognize_ingredients,
@@ -118,6 +121,15 @@ def interpret_model_response(response, action, parse, parse_failure_message):
     if not parsed:
         return None, parse_failure_message, content
     return parsed, None, None
+
+
+@st.cache_data(max_entries=8, ttl=1800, show_spinner=False)
+def photo_preview(raw_bytes):
+    """업로드 사진의 화면 표시용 바이트(최대 폭 1460px). 같은 사진이면 rerun마다 다시 만들지 않는다.
+
+    InvalidImageError는 캐시되지 않고 그대로 올라간다.
+    """
+    return make_preview_bytes(raw_bytes)
 
 
 def get_api_key():
@@ -309,10 +321,19 @@ if wizard_step == 1:
             st.error("이미지 용량이 10MB를 초과합니다. 더 작은 이미지를 업로드해주세요.")
             st.stop()
 
+        raw_photo = uploaded_file.getvalue()
+        try:
+            # 표시용 축소본은 사진당 한 번만 만든다. st.image에 원본을 넘기면 rerun마다
+            # 원본 전체를 디코딩·축소·재인코딩한다. 손상·초대형 이미지도 여기서 걸러진다.
+            preview_bytes = photo_preview(raw_photo)
+        except InvalidImageError as e:
+            st.error(f"❌ {e}")
+            st.stop()
+
         photo_col, recognize_col = st.columns(2)
 
         with photo_col:
-            st.image(uploaded_file, caption="업로드한 사진", use_container_width=True)
+            st.image(preview_bytes, caption="업로드한 사진", use_container_width=True)
 
         with recognize_col:
             if st.button("식재료 인식하기", type="primary"):
@@ -321,11 +342,17 @@ if wizard_step == 1:
                 st.session_state.pop("ingredients", None)
                 st.session_state.pop("recipes", None)
                 st.session_state.pop("selected_recipe", None)
-                st.session_state.uploaded_photo_bytes = uploaded_file.getvalue()
+                # 2단계 화면 표시에만 쓰므로 원본(최대 10MB) 대신 표시용 축소본을 세션에 둔다.
+                st.session_state.uploaded_photo_bytes = preview_bytes
                 st.session_state.uploaded_photo_name = uploaded_file.name
 
                 with st.status("사진을 분석하는 중입니다...", expanded=True) as status:
-                    data_uri, resized_bytes = to_resized_data_uri(uploaded_file)
+                    try:
+                        data_uri, resized_bytes = to_resized_data_uri(io.BytesIO(raw_photo))
+                    except InvalidImageError as e:
+                        status.update(label="분석 실패", state="error")
+                        st.session_state.recognition_error = f"❌ 식재료 인식 실패: {e}"
+                        st.rerun()
                     status.write(
                         f"이미지 축소: {uploaded_file.size // 1024}KB → {resized_bytes // 1024}KB "
                         f"(긴 변 {MAX_IMAGE_DIMENSION}px 이하)"
