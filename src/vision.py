@@ -16,6 +16,8 @@ MAX_INPUT_PIXELS = 64_000_000
 # st.image가 화면 표시용으로 줄이는 최대 폭(Streamlit 내부 MAXIMUM_CONTENT_WIDTH = 2×730)과 같게 맞춘다.
 PREVIEW_MAX_WIDTH = 1460
 _EXIF_ORIENTATION_TAG = 0x0112
+# 재료 수량 입력칸의 최대값. 모델이 비정상적으로 큰 수를 보내도 입력칸이 깨지지 않게 한다.
+MAX_QUANTITY = 99999
 UNIT_OPTIONS = ["개", "병", "봉지", "팩", "단", "g", "kg", "ml", "L", "기타"]
 RECOGNITION_PROMPT = (
     '이 냉장고 사진에서 보이는 식재료를 한국어로 인식해서 JSON 배열 형식으로만 답해줘. '
@@ -74,7 +76,7 @@ def list_free_vision_models_detailed():
 
 
 _DECODE_ERRORS = (OSError, ValueError, SyntaxError, EOFError, Image.DecompressionBombError)
-_UNREADABLE_MESSAGE = "이미지 파일을 읽을 수 없습니다. 손상되지 않은 JPG/PNG 파일인지 확인해주세요."
+_UNREADABLE_MESSAGE = "이미지 파일을 읽을 수 없어요. 손상되지 않은 JPG/PNG 사진인지 확인하고 다시 올려 주세요."
 
 
 def _open_checked(file_like):
@@ -87,8 +89,8 @@ def _open_checked(file_like):
     if width * height > MAX_INPUT_PIXELS:
         image.close()
         raise InvalidImageError(
-            f"이미지 해상도가 너무 큽니다 ({width}×{height}). "
-            f"{MAX_INPUT_PIXELS // 1_000_000}백만 화소 이하로 줄여서 올려주세요."
+            f"이미지 해상도가 너무 커요 ({width}×{height}). "
+            f"{MAX_INPUT_PIXELS // 10_000}만 화소 이하로 줄인 사진을 올려 주세요."
         )
     return image
 
@@ -212,6 +214,23 @@ def merge_duplicate_ingredients(ingredients):
     return [merged[key] for key in order]
 
 
+def is_empty_result(content):
+    """모델이 형식은 지켰지만 빈 배열([])로 답했는지(=사진에서 재료를 찾지 못함) 판별한다.
+
+    화면에서 "응답을 해석하지 못함"과 "재료가 없음"을 구분해 안내하기 위해 쓴다.
+    """
+    if not isinstance(content, str):
+        return False
+    match = re.search(r"\[.*\]", content, re.DOTALL)
+    if not match:
+        return False
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(data, list) and not data
+
+
 def parse_ingredients(content):
     """모델 응답을 [{"name", "quantity", "unit"}, ...] 형태로 파싱한다.
 
@@ -242,6 +261,8 @@ def parse_ingredients(content):
                 quantity = int(float(item.get("quantity", 1)))
             except (TypeError, ValueError, OverflowError):
                 quantity = 1
+            # 음수·비정상적으로 큰 수량은 수량 입력칸(0~MAX_QUANTITY)에 넣을 수 없어 화면이 멈춘다.
+            quantity = min(max(quantity, 0), MAX_QUANTITY)
             unit = str(item.get("unit") or "개").strip() or "개"
         else:
             name = str(item).strip()

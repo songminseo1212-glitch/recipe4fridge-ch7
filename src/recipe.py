@@ -106,7 +106,7 @@ def generate_recipes(ingredient_names, api_key, on_attempt=None, attempts=3, all
 
     def accept(content):
         recipes = parse_recipes(content)
-        return bool(recipes) and _is_korean_enough(recipes)
+        return bool(recipes) and is_korean_enough(recipes)
 
     return openrouter.call_with_fallback(
         models,
@@ -119,7 +119,7 @@ def generate_recipes(ingredient_names, api_key, on_attempt=None, attempts=3, all
 _HANGUL_RE = re.compile(r"[가-힣]")
 
 
-def _is_korean_enough(recipes):
+def is_korean_enough(recipes):
     """레시피명/조리 순서에 한글이 전혀 없으면(영어로만 응답한 경우) 실패로 간주한다."""
     parts = []
     for r in recipes:
@@ -142,7 +142,55 @@ def parse_recipes(content):
         data = json.loads(match.group(0))
     except json.JSONDecodeError:
         return None
+    if not isinstance(data, dict):
+        return None
     recipes = data.get("recipes")
     if not isinstance(recipes, list):
         return None
-    return recipes
+    normalized = [_normalize_recipe(r) for r in recipes if isinstance(r, dict)]
+    return normalized or None
+
+
+_DIGITS_RE = re.compile(r"\d+")
+
+
+def _text_list(value):
+    """문자열 목록으로 정리한다. 문자열 하나면 [문자열], 목록이 아니면 []. 빈 항목은 뺀다."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [str(v).strip() for v in value if v is not None and str(v).strip()]
+
+
+def _cook_minutes(value):
+    """조리 시간을 분 단위 정수로. "20분"처럼 글자가 섞이면 첫 숫자를 쓰고, 알 수 없으면 None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            minutes = int(value)
+        except (ValueError, OverflowError):
+            return None
+        return minutes if minutes > 0 else None
+    if isinstance(value, str):
+        match = _DIGITS_RE.search(value)
+        if match:
+            minutes = int(match.group(0))
+            return minutes if minutes > 0 else None
+    return None
+
+
+def _normalize_recipe(recipe):
+    """화면 표시·DB 저장이 깨지지 않도록 레시피 한 개의 필드 형식을 맞춘다.
+
+    모델은 cook_time_minutes에 "20분"이나 null을, 목록 필드에 문자열이나 숫자를 섞어 보내기도 한다.
+    """
+    # 이름이 비어도 기본 문구로 채우지 않는다 (채우면 영어 응답이 한글 검사를 통과해 버린다). 표시할 때 채운다.
+    return {
+        "name": str(recipe.get("name") or "").strip(),
+        "used_ingredients": _text_list(recipe.get("used_ingredients")),
+        "missing_ingredients": _text_list(recipe.get("missing_ingredients")),
+        "steps": _text_list(recipe.get("steps")),
+        "cook_time_minutes": _cook_minutes(recipe.get("cook_time_minutes")),
+    }
