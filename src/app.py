@@ -9,6 +9,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 import db
+import openrouter
 from auth_ui import current_user, render_sidebar_auth
 from recipe import (
     CUISINE_OPTIONS,
@@ -59,22 +60,16 @@ def rate_limit_message(response, action):
     둘은 사용자가 할 일이 다르다. 일일 한도는 초기화될 때까지 다시 눌러도 소용없고,
     순간 혼잡은 잠시 뒤 다시 시도하면 대체로 풀린다.
     """
-    try:
-        error = (response.json() or {}).get("error") or {}
-    except ValueError:
-        error = {}
-    metadata = error.get("metadata") or {}
-    is_daily = (
-        "free-models-per-day" in str(error.get("message") or "")
-        or metadata.get("limit_source") == "openrouter_free_tier_daily"
-    )
-    if not is_daily:
+    if not openrouter.is_daily_limit(response):
         return (
             f"❌ {action} 실패: 무료 모델 3곳이 모두 혼잡합니다 (429). "
             "1~2분 뒤에 다시 시도해 주세요."
         )
 
-    headers = metadata.get("headers") or {}
+    metadata = openrouter.error_info(response).get("metadata")
+    headers = metadata.get("headers") if isinstance(metadata, dict) else None
+    if not isinstance(headers, dict):
+        headers = {}
     limit = headers.get("X-RateLimit-Limit")
     quota = f"오늘 쓸 수 있는 무료 호출 {limit}회를" if limit else "오늘 쓸 수 있는 무료 호출을"
     when = _format_reset_time(headers.get("X-RateLimit-Reset"))
@@ -96,6 +91,33 @@ def _format_reset_time(reset_ms):
     half = "오전" if moment.hour < 12 else "오후"
     hour = moment.hour % 12 or 12
     return f"{moment.month}월 {moment.day}일 {half} {hour}시에"
+
+
+def interpret_model_response(response, action, parse, parse_failure_message):
+    """인식/레시피 공통: 최종 응답을 (결과, 오류 문구, 기술 정보)로 해석한다.
+
+    성공이면 (parse 결과, None, None), 실패면 (None, 오류 문구, 기술 정보 또는 None).
+    """
+    if response is None:
+        return None, f"❌ {action} 실패: 모델 응답을 받지 못했습니다. 잠시 후 다시 시도해주세요.", None
+    status = response.status_code
+    if status == 429:
+        return None, rate_limit_message(response, action), response.text
+    if status >= 500:
+        return None, f"❌ {action} 실패: 모델 제공자 서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요.", None
+    if status != 200:
+        return None, f"❌ {action} 실패: 요청이 실패했습니다 (status {status}).", response.text
+    content = openrouter.extract_content(response)
+    if content is None:
+        return (
+            None,
+            f"❌ {action} 실패: 모델 응답 형식이 올바르지 않습니다 (응답 내용 없음). 잠시 후 다시 시도해주세요.",
+            response.text,
+        )
+    parsed = parse(content)
+    if not parsed:
+        return None, parse_failure_message, content
+    return parsed, None, None
 
 
 def get_api_key():
@@ -327,29 +349,19 @@ if wizard_step == 1:
 
                 st.session_state.used_vision_model = used_model
 
-                if response.status_code == 429:
-                    st.session_state.recognition_error = rate_limit_message(response, "식재료 인식")
-                    st.session_state.recognition_error_detail = response.text
-                elif response.status_code >= 500:
-                    st.session_state.recognition_error = "❌ 식재료 인식 실패: 모델 제공자 서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
-                elif response.status_code != 200:
-                    st.session_state.recognition_error = f"❌ 식재료 인식 실패: 요청이 실패했습니다 (status {response.status_code})."
-                    st.session_state.recognition_error_detail = response.text
+                ingredients, error, detail = interpret_model_response(
+                    response,
+                    "식재료 인식",
+                    parse_ingredients,
+                    "❌ 식재료 인식 실패: 서로 다른 모델 3차 시도 모두 응답을 재료 목록으로 변환하지 못했습니다.",
+                )
+                if error:
+                    st.session_state.recognition_error = error
+                    if detail:
+                        st.session_state.recognition_error_detail = detail
                 else:
-                    body = response.json()
-                    choices = body.get("choices")
-                    if not choices:
-                        st.session_state.recognition_error = "❌ 식재료 인식 실패: 모델 응답 형식이 올바르지 않습니다 (choices 없음). 잠시 후 다시 시도해주세요."
-                        st.session_state.recognition_error_detail = response.text
-                    else:
-                        content = choices[0]["message"]["content"]
-                        ingredients = parse_ingredients(content)
-                        if ingredients is None:
-                            st.session_state.recognition_error = "❌ 식재료 인식 실패: 서로 다른 모델 3차 시도 모두 응답을 재료 목록으로 변환하지 못했습니다."
-                            st.session_state.recognition_error_detail = content
-                        else:
-                            st.session_state.ingredients = ingredients
-                            st.session_state.wizard_step = 2
+                    st.session_state.ingredients = ingredients
+                    st.session_state.wizard_step = 2
                 st.rerun()
 
             if st.session_state.get("used_vision_model"):
@@ -496,46 +508,25 @@ elif wizard_step == 3:
 
             st.session_state.used_recipe_model = used_recipe_model
 
-            if response.status_code == 429:
+            recipes, error, detail = interpret_model_response(
+                response,
+                "레시피 생성",
+                parse_recipes,
+                "❌ 레시피 생성 실패: 서로 다른 모델 3차 시도 모두 응답을 레시피로 변환하지 못했습니다.",
+            )
+            if error:
                 st.session_state.pop("recipes", None)
                 st.session_state.pop("selected_recipe", None)
-                st.error(rate_limit_message(response, "레시피 생성"))
-                with st.expander("자세히 보기 (기술 정보)"):
-                    st.code(response.text)
-            elif response.status_code >= 500:
-                st.session_state.pop("recipes", None)
-                st.session_state.pop("selected_recipe", None)
-                st.error("❌ 레시피 생성 실패: 모델 제공자 서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
-            elif response.status_code != 200:
-                st.session_state.pop("recipes", None)
-                st.session_state.pop("selected_recipe", None)
-                st.error(f"❌ 레시피 생성 실패: 요청이 실패했습니다 (status {response.status_code}).")
-                with st.expander("자세히 보기 (기술 정보)"):
-                    st.code(response.text)
-            else:
-                body = response.json()
-                choices = body.get("choices")
-                if not choices:
-                    st.session_state.pop("recipes", None)
-                    st.session_state.pop("selected_recipe", None)
-                    st.error("❌ 레시피 생성 실패: 모델 응답 형식이 올바르지 않습니다 (choices 없음). 잠시 후 다시 시도해주세요.")
+                st.error(error)
+                if detail:
                     with st.expander("자세히 보기 (기술 정보)"):
-                        st.code(response.text)
-                else:
-                    content = choices[0]["message"]["content"]
-                    recipes = parse_recipes(content)
-                    if not recipes:
-                        st.session_state.pop("recipes", None)
-                        st.session_state.pop("selected_recipe", None)
-                        st.error("❌ 레시피 생성 실패: 서로 다른 모델 3차 시도 모두 응답을 레시피로 변환하지 못했습니다.")
-                        with st.expander("자세히 보기 (기술 정보)"):
-                            st.code(content)
-                    else:
-                        st.session_state.recipes = recipes
-                        st.session_state.selected_recipe = 0
-                        # 인디케이터(③ 레시피 추천)는 화면 상단, 이 성공 처리보다 먼저 그려진다.
-                        # 여기서 즉시 rerun해야 인디케이터가 방금 세팅된 recipes를 반영해 체크 표시로 바뀐다.
-                        st.rerun()
+                        st.code(detail)
+            else:
+                st.session_state.recipes = recipes
+                st.session_state.selected_recipe = 0
+                # 인디케이터(③ 레시피 추천)는 화면 상단, 이 성공 처리보다 먼저 그려진다.
+                # 여기서 즉시 rerun해야 인디케이터가 방금 세팅된 recipes를 반영해 체크 표시로 바뀐다.
+                st.rerun()
 
         if st.session_state.get("used_recipe_model"):
             st.caption(f"실제 응답 모델: `{st.session_state.used_recipe_model}`")

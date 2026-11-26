@@ -1,13 +1,7 @@
 import json
-import random
 import re
-import time
 
-import requests
-import streamlit as st
-
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODELS_URL = "https://openrouter.ai/api/v1/models"
+import openrouter
 
 CUISINE_OPTIONS = ["상관없음", "한식", "양식", "중식", "일식"]
 DIFFICULTY_OPTIONS = ["상관없음", "초급", "중급", "고급"]
@@ -19,7 +13,6 @@ SAFETY_NET_RECIPE_MODELS = [
     "nvidia/nemotron-3.5-super-vl:free",
     "cohere/north-mini-code:free",
 ]
-_EXCLUDE_KEYWORDS = ["safety", "rerank", "guard"]
 
 # 2026-10-31 재료 7종으로 다시 실측한 우선순위. 앞쪽일수록 먼저 시도한다.
 # minimax-m3(2026-10-22)와 nemotron-3-super(2026-10-30)는 무료 목록에서 빠졌다.
@@ -35,78 +28,26 @@ PREFERRED_RECIPE_MODELS = [
     "cohere/north-mini-code:free",
 ]
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _fetch_models_payload():
-    """오픈라우터 모델 목록 원본을 5분간 캐시한다.
-
-    실패하면 예외를 그대로 올려서 실패 결과가 캐시에 남지 않게 한다
-    (일시적인 네트워크 오류가 5분 동안 굳어지지 않도록).
-    """
-    response = requests.get(MODELS_URL, timeout=10)
-    response.raise_for_status()
-    return response.json().get("data", [])
-
-
-def _fetch_free_text_model_entries():
-    """오픈라우터에서 레시피 생성에 쓸 수 있는 무료 모델의 원본 정보를 조회한다(5분 캐시).
-
-    이미지 입력을 함께 받는 모델도 텍스트 프롬프트에 정상 응답하므로 제외하지 않는다.
-    """
-    try:
-        data = _fetch_models_payload()
-    except (requests.exceptions.RequestException, ValueError):
-        return []
-
-    entries = []
-    for m in data:
-        model_id = m.get("id", "")
-        if not model_id.endswith(":free"):
-            continue
-        if any(keyword in model_id.lower() for keyword in _EXCLUDE_KEYWORDS):
-            continue
-        entries.append(m)
-    return entries
-
 
 def list_free_text_models(allowed_models=None):
     """현재 사용 가능한 무료 텍스트 모델 id 목록. allowed_models가 주어지면 그 안에서만 고른다.
 
+    이미지 입력을 함께 받는 모델도 텍스트 프롬프트에 정상 응답하므로 제외하지 않는다.
     allowed_models로 걸러낸 결과가 비어있으면(사용자가 골라둔 모델이 전부 사라진 경우)
     안전하게 전체 목록으로 되돌아간다.
     """
-    entries = _fetch_free_text_model_entries()
-    models = [m.get("id", "") for m in entries] or list(SAFETY_NET_RECIPE_MODELS)
-    if allowed_models:
-        filtered = [m for m in models if m in allowed_models]
-        if filtered:
-            return filtered
-    return models
+    entries = openrouter.free_model_entries(require_image=False)
+    return openrouter.model_ids(entries, SAFETY_NET_RECIPE_MODELS, allowed_models)
 
 
 def prioritize_models(pool):
-    """실측 우선순위(PREFERRED_RECIPE_MODELS) 순서로 후보를 정렬한다.
-
-    우선순위 목록에 없는 모델은 뒤쪽에 무작위 순서로 배치한다. 무료 모델 라인업은
-    수시로 바뀌므로, 아직 실측하지 않은 새 모델도 뒤에서는 시도될 수 있게 남겨둔다.
-    """
-    ranked = [m for m in PREFERRED_RECIPE_MODELS if m in pool]
-    rest = [m for m in pool if m not in ranked]
-    random.shuffle(rest)
-    return ranked + rest
+    """실측 우선순위(PREFERRED_RECIPE_MODELS) 순서로 후보를 정렬한다."""
+    return openrouter.prioritize_models(pool, PREFERRED_RECIPE_MODELS)
 
 
 def list_free_text_models_detailed():
     """프로필 화면의 모델 선택 UI에 쓸 상세 정보(id/name/context_length/created)를 반환."""
-    entries = _fetch_free_text_model_entries()
-    return [
-        {
-            "id": m.get("id", ""),
-            "name": m.get("name") or m.get("id", ""),
-            "context_length": m.get("context_length"),
-            "created": m.get("created"),
-        }
-        for m in entries
-    ]
+    return openrouter.model_details(openrouter.free_model_entries(require_image=False))
 
 
 def build_prompt(ingredient_names, cuisine=None, difficulty=None, time_pref=None, servings=None):
@@ -144,56 +85,35 @@ def build_prompt(ingredient_names, cuisine=None, difficulty=None, time_pref=None
 
 
 def call_recipe_model(model, ingredient_names, api_key, **options):
-    return requests.post(
-        API_URL,
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": build_prompt(ingredient_names, **options)}],
-        },
-        timeout=60,
-    )
+    messages = [{"role": "user", "content": build_prompt(ingredient_names, **options)}]
+    return openrouter.post_chat(model, messages, api_key)
 
 
 def generate_recipes(ingredient_names, api_key, on_attempt=None, attempts=3, allowed_models=None, **options):
-    """매 시도마다 오픈라우터의 현재 무료 텍스트 모델 중 서로 다른 모델을 순서대로 시도한다.
+    """오픈라우터의 현재 무료 텍스트 모델 중 서로 다른 모델을 순서대로 시도한다.
 
     실측 우선순위(PREFERRED_RECIPE_MODELS)가 앞에 오고, 아직 실측하지 않은 모델이
-    무작위 순서로 뒤를 잇는다. 429든 JSON 파싱 실패든 한국어가 아닌 응답이든 실패로
-    간주하고, 성공할 때까지 또는 attempts 횟수만큼 다음 모델로 넘어간다 (별도의 고정
-    폴백 모델 없이, 매 시도 자체가 폴백 역할을 겸함).
+    무작위 순서로 뒤를 잇는다. 429·5xx·타임아웃·연결 오류·200인데 내용 없음·JSON 파싱 실패·
+    한국어가 아닌 응답은 다음 모델로 넘어가고, 401/402·무료 일일 한도처럼 모델을 바꿔도 같은
+    오류는 바로 멈춘다 (세부 정책은 openrouter.call_with_fallback 참고).
     allowed_models: 사용자가 프로필에서 선택한 모델 id 목록. 없으면 전체 무료 모델을 대상으로 한다.
+    반환: (response, used_model)
     """
     pool = prioritize_models(list_free_text_models(allowed_models=allowed_models))
-    if pool:
-        # 풀이 attempts보다 적으면(예: 사용자가 모델을 1~2개만 선택한 경우) 안전망 모델로
-        # 채우지 않고 풀 안에서 순환한다 - 사용자가 고르지 않은 모델을 몰래 끼워넣지 않기 위함.
-        models = [pool[i % len(pool)] for i in range(attempts)]
-    else:
-        models = [random.choice(SAFETY_NET_RECIPE_MODELS) for _ in range(attempts)]
+    models = openrouter.plan_attempts(pool, attempts, SAFETY_NET_RECIPE_MODELS)
+    prompt = build_prompt(ingredient_names, **options)
+    messages = [{"role": "user", "content": prompt}]
 
-    response = None
-    used_model = models[0]
-    for i, model in enumerate(models):
-        label = f"{i + 1}차 시도"
-        if on_attempt is not None:
-            on_attempt(label, model)
-        response = call_recipe_model(model, ingredient_names, api_key, **options)
-        used_model = model
-        if response.status_code == 200:
-            try:
-                body = response.json()
-                choices = body.get("choices")
-                if choices:
-                    recipes = parse_recipes(choices[0]["message"]["content"])
-                    if recipes and _is_korean_enough(recipes):
-                        break
-            except ValueError:
-                pass
-        if i < len(models) - 1:
-            # 429는 모델별 순간 혼잡이라 1초로는 잘 풀리지 않는다. 시도마다 대기를 늘린다.
-            time.sleep(2 * (i + 1))
-    return response, used_model
+    def accept(content):
+        recipes = parse_recipes(content)
+        return bool(recipes) and _is_korean_enough(recipes)
+
+    return openrouter.call_with_fallback(
+        models,
+        send=lambda model: openrouter.post_chat(model, messages, api_key),
+        accept=accept,
+        on_attempt=on_attempt,
+    )
 
 
 _HANGUL_RE = re.compile(r"[가-힣]")
@@ -201,13 +121,20 @@ _HANGUL_RE = re.compile(r"[가-힣]")
 
 def _is_korean_enough(recipes):
     """레시피명/조리 순서에 한글이 전혀 없으면(영어로만 응답한 경우) 실패로 간주한다."""
-    combined = " ".join(
-        (r.get("name") or "") + " " + " ".join(r.get("steps") or []) for r in recipes
-    )
-    return bool(_HANGUL_RE.search(combined))
+    parts = []
+    for r in recipes:
+        if not isinstance(r, dict):
+            continue
+        parts.append(str(r.get("name") or ""))
+        steps = r.get("steps")
+        if isinstance(steps, list):
+            parts.extend(str(step) for step in steps)
+    return bool(_HANGUL_RE.search(" ".join(parts)))
 
 
 def parse_recipes(content):
+    if not isinstance(content, str):
+        return None
     match = re.search(r"\{.*\}", content, re.DOTALL)
     if not match:
         return None
