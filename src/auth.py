@@ -6,7 +6,7 @@ import db
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-GENERIC_LOGIN_ERROR = "이메일 또는 비밀번호가 올바르지 않습니다."
+GENERIC_LOGIN_ERROR = "이메일 또는 비밀번호가 맞지 않아요. 다시 확인해 주세요."
 
 
 def hash_password(password):
@@ -23,13 +23,13 @@ def signup(email, password, nickname):
     nickname = nickname.strip()
 
     if not EMAIL_PATTERN.match(email):
-        return False, "올바른 이메일 형식이 아닙니다."
+        return False, "이메일 형식이 올바르지 않아요. 예: you@example.com"
     if len(password) < 8:
-        return False, "비밀번호는 8자 이상이어야 합니다."
+        return False, "비밀번호는 8자 이상으로 입력해 주세요."
     if not nickname:
-        return False, "닉네임을 입력해주세요."
+        return False, "닉네임을 입력해 주세요."
     if db.email_exists(email):
-        return False, "이미 가입된 이메일입니다."
+        return False, "이미 가입된 이메일이에요. 로그인 탭에서 로그인해 주세요."
 
     user_id = db.create_user(email, hash_password(password), nickname)
     return True, {"id": user_id, "email": email, "nickname": nickname}
